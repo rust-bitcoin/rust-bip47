@@ -21,3 +21,7 @@ let bob_address_0 = bob_public.address(&alice_private, 0, false).unwrap();
 assert_eq!("12edoJAofkjCsWrtmVjuQgMUKJ6Z7Ntpzx", bob_address_0.to_string());
 
 ```
+
+## MSRV
+The minimum supported Rust version is **1.29**.
+

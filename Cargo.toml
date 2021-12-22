@@ -2,7 +2,6 @@
 name = "bip47"
 version = "0.1.0"
 authors = ["Straylight <https://github.com/straylight-orbit>"]
-edition = "2021"
 license = "CC0-1.0"
 description = "BIP47 (Reusable Payment Codes) implementation"
 repository = "https://github.com/straylight-orbit/rust-bip47"

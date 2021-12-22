@@ -21,6 +21,8 @@
 //!
 //! ## Usage
 //! ```
+//! # extern crate bitcoin;
+//! # extern crate bip47;
 //! # use {bip47::PrivateCode, bip47::PublicCode, bitcoin::Network};
 //! # let alice_seed = [0_u8];
 //! // Alice constructs her own payment code using a BIP32 seed
@@ -38,6 +40,8 @@
 //! ```
 
 use std::str::FromStr;
+
+pub extern crate bitcoin;
 
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::Secp256k1;
@@ -202,7 +206,7 @@ impl PublicCode {
 
     /// Parses a WIF-formatted payment code.
     pub fn from_wif(payment_code: &str) -> Result<Self, Error> {
-        payment_code.try_into()
+        PublicCode::try_from_str(payment_code)
     }
 
     /// Returns the notification mode to be used with this payment code.
@@ -295,13 +299,16 @@ impl PublicCode {
 
         // skip the OP_RETURN opcode, move on to the actual bytes
         if let Some(Ok(PushBytes(data))) = op_return.script_pubkey.instructions().nth(1) {
-            let mut code_bytes: [u8; PAYMENT_CODE_BIN_LENGTH] = data
-                .try_into()
-                .map_err(|_| Error::Notification("OP_RETURN incorrect length"))?;
+            if data.len() == PAYMENT_CODE_BIN_LENGTH {
+                let mut code_bytes: [u8; PAYMENT_CODE_BIN_LENGTH] = [0; PAYMENT_CODE_BIN_LENGTH];
+                code_bytes.copy_from_slice(data);
 
-            blind_payment_code(&mut code_bytes, &blinding_factor);
+                blind_payment_code(&mut code_bytes, &blinding_factor);
 
-            PublicCode::try_from(&code_bytes[..])
+                PublicCode::try_from_bytes(&code_bytes[..])
+            } else {
+                Err(Error::Notification("OP_RETURN incorrect length"))
+            }
         } else {
             Err(Error::Notification("OP_RETURN not found"))
         }
@@ -320,10 +327,8 @@ impl std::fmt::Display for PublicCode {
     }
 }
 
-impl TryFrom<&[u8]> for PublicCode {
-    type Error = Error;
-
-    fn try_from(payment_code: &[u8]) -> Result<Self, Self::Error> {
+impl PublicCode {
+    fn try_from_bytes(payment_code: &[u8]) -> Result<Self, Error> {
         if payment_code.len() != PAYMENT_CODE_BIN_LENGTH {
             return Err(Error::Format("Incorrect binary length"));
         }
@@ -332,10 +337,14 @@ impl TryFrom<&[u8]> for PublicCode {
         let bitmessage = payment_code[1] == 0x80;
         let public_key = PublicKey::from_slice(&payment_code[2..35])?;
         let chain_code = ChainCode::from(&payment_code[35..67]);
-        let bitmessage = bitmessage.then(|| BitMessagePreference {
-            version: payment_code[67],
-            stream_number: payment_code[68],
-        });
+        let bitmessage = if bitmessage {
+            Some(BitMessagePreference {
+                version: payment_code[67],
+                stream_number: payment_code[68],
+            })
+        } else {
+            None
+        };
 
         // when parsing a WIF-formatted paymenty code, we assume mainnet
         let network = bitcoin::Network::Bitcoin;
@@ -357,19 +366,15 @@ impl TryFrom<&[u8]> for PublicCode {
             network,
         })
     }
-}
 
-impl TryFrom<&str> for PublicCode {
-    type Error = Error;
-
-    fn try_from(value: &str) -> Result<Self, Error> {
+    fn try_from_str(value: &str) -> Result<Self, Error> {
         let payment_code = base58::from_check(value).map_err(Error::Base58)?;
 
         if payment_code.first() != Some(&LETTER_P) {
             return Err(Error::Format("Incorrect format version"));
         }
 
-        PublicCode::try_from(&payment_code[1..])
+        PublicCode::try_from_bytes(&payment_code[1..])
     }
 }
 
@@ -546,7 +551,7 @@ fn blinding_factor(
 
     let mut encoded_utxo = Vec::with_capacity(36);
     encoded_utxo.extend_from_slice(&utxo.txid);
-    encoded_utxo.extend_from_slice(&utxo.vout.to_le_bytes());
+    encoded_utxo.extend_from_slice(&u32_to_le_bytes(utxo.vout));
 
     use bitcoin::hashes::{self, sha512, HashEngine, Hmac};
     let mut hmac = hashes::hmac::HmacEngine::<sha512::Hash>::new(&encoded_utxo);
@@ -558,9 +563,13 @@ fn blinding_factor(
 
 /// Blinds a payment code using a byte mask.
 fn blind_payment_code(bytes: &mut [u8; PAYMENT_CODE_BIN_LENGTH], mask: &[u8; 64]) {
-    bytes.iter_mut().skip(3).zip(mask).for_each(|(a, b)| {
-        *a ^= b;
-    });
+    bytes
+        .iter_mut()
+        .skip(3)
+        .zip(mask.iter())
+        .for_each(|(a, b)| {
+            *a ^= b;
+        });
 }
 
 /// Generates outputs for a notification transaction. Both outputs must be included and the notification
@@ -590,25 +599,36 @@ fn find_designated(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
     use bitcoin::blockdata::script::Instruction::PushBytes;
 
     fn from_scriptsig(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
-        tx.input.iter().find_map(|tx_in| {
-            let first_pk = tx_in.script_sig.instructions().find_map(|op| match op {
-                Ok(PushBytes(bytes)) => PublicKey::from_slice(bytes).ok(),
-                _ => None,
-            });
+        tx.input
+            .iter()
+            .filter_map(|tx_in| {
+                let first_pk = tx_in
+                    .script_sig
+                    .instructions()
+                    .filter_map(|op| match op {
+                        Ok(PushBytes(bytes)) => PublicKey::from_slice(bytes).ok(),
+                        _ => None,
+                    })
+                    .next();
 
-            first_pk.map(|pk| (pk, tx_in.previous_output))
-        })
+                first_pk.map(|pk| (pk, tx_in.previous_output))
+            })
+            .next()
     }
 
     fn from_witness(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
-        tx.input.iter().find_map(|tx_in| {
-            let first_pk = tx_in
-                .witness
-                .iter()
-                .find_map(|witness| PublicKey::from_slice(witness).ok());
+        tx.input
+            .iter()
+            .filter_map(|tx_in| {
+                let first_pk = tx_in
+                    .witness
+                    .iter()
+                    .filter_map(|witness| PublicKey::from_slice(witness).ok())
+                    .next();
 
-            first_pk.map(|pk| (pk, tx_in.previous_output))
-        })
+                first_pk.map(|pk| (pk, tx_in.previous_output))
+            })
+            .next()
     }
 
     from_scriptsig(tx).or_else(|| from_witness(tx))
@@ -628,29 +648,37 @@ pub enum Error {
 
 impl From<bip32::Error> for Error {
     fn from(error: bip32::Error) -> Self {
-        Self::Bip32(error)
+        Error::Bip32(error)
     }
 }
 
 impl From<secp256k1::Error> for Error {
     fn from(error: secp256k1::Error) -> Self {
-        Self::Ecdsa(error)
+        Error::Ecdsa(error)
     }
 }
 
 impl From<bitcoin::util::key::Error> for Error {
     fn from(error: bitcoin::util::key::Error) -> Self {
         match error {
-            bitcoin::util::key::Error::Base58(error) => Self::Base58(error),
-            bitcoin::util::key::Error::Secp256k1(error) => Self::Ecdsa(error),
+            bitcoin::util::key::Error::Base58(error) => Error::Base58(error),
+            bitcoin::util::key::Error::Secp256k1(error) => Error::Ecdsa(error),
         }
     }
 }
 
 impl From<address::Error> for Error {
     fn from(error: address::Error) -> Self {
-        Self::Address(error)
+        Error::Address(error)
     }
+}
+
+fn u32_to_le_bytes(x: u32) -> [u8; 4] {
+    let b1: u8 = (x & 0xff) as u8;
+    let b2: u8 = ((x >> 8) & 0xff) as u8;
+    let b3: u8 = ((x >> 16) & 0xff) as u8;
+    let b4: u8 = ((x >> 24) & 0xff) as u8;
+    [b1, b2, b3, b4]
 }
 
 #[cfg(test)]
@@ -660,12 +688,14 @@ mod tests {
     use std::fmt::Write;
     use std::str::FromStr;
 
-    use bitcoin::hashes::hex::HexIterator;
+    extern crate bitcoin;
+
+    use bitcoin::hashes::{self, hex::HexIterator};
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::util::psbt::serialize::Deserialize;
     use bitcoin::{Address, Network, PrivateKey, PublicKey};
 
-    use crate::{
+    use super::{
         blind_payment_code, blinding_factor, find_designated, make_v1_notification_scripts,
         secret_point, NotificationMode, PrivateCode, PublicCode,
     };
@@ -734,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_payment_code_from_seed() {
-        let seed: Vec<u8> = bitcoin::hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
+        let seed: Vec<u8> = hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
         let private = PrivateCode::from_seed(&seed, 0, Network::Bitcoin).unwrap();
         let public = private.v1_public_code(None);
 
@@ -779,8 +809,7 @@ mod tests {
     #[allow(non_snake_case)]
     fn test_ecdh_params() {
         // Alice
-        let alice_seed: Vec<u8> =
-            bitcoin::hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
+        let alice_seed: Vec<u8> = hashes::hex::FromHex::from_hex(ALICE_BIP32_SEED).unwrap();
         let alice_private = PrivateCode::from_seed(&alice_seed, 0, Network::Bitcoin).unwrap();
 
         let alice_a0 = alice_private.child(0).unwrap();
@@ -789,7 +818,7 @@ mod tests {
         assert_eq!(ALICE_A0, alice_A0.key.to_string());
 
         // Bob
-        let bob_seed: Vec<u8> = bitcoin::hashes::hex::FromHex::from_hex(BOB_BIP32_SEED).unwrap();
+        let bob_seed: Vec<u8> = hashes::hex::FromHex::from_hex(BOB_BIP32_SEED).unwrap();
         let bob_private = PrivateCode::from_seed(&bob_seed, 0, Network::Bitcoin).unwrap();
 
         let bob_b0 = bob_private.child(0).unwrap();
@@ -903,7 +932,12 @@ mod tests {
 
         // Unblind
         blind_payment_code(&mut alice_bytes, &blinding_factor);
-        assert_eq!(alice_bytes, alice_public.as_bytes());
+        assert_eq!(
+            PublicCode::try_from_bytes(&alice_bytes)
+                .unwrap()
+                .to_string(),
+            ALICE_PAYMENT_CODE
+        );
     }
 
     #[test]
