@@ -1,6 +1,6 @@
 [package]
 name = "bip47"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Straylight <https://github.com/straylight-orbit>"]
 license = "CC0-1.0"
 description = "BIP47 (Reusable Payment Codes) implementation"
