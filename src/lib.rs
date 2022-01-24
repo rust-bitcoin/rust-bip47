@@ -162,13 +162,9 @@ impl PrivateCode {
         Ok(key.private_key)
     }
 
-    /// Derives a receive address at the given index. If the index is invalid, it should be incremented.
-    pub fn address(
-        &self,
-        sender_code: &PublicCode,
-        i: u32,
-        segwit: bool,
-    ) -> Result<Address, Error> {
+    /// Derives a receive private key at the given index, with respect to a public payment code. Used for spending purposes.
+    /// If the index is invalid, it should be incremented.
+    pub fn private_key(&self, sender_code: &PublicCode, i: u32) -> Result<PrivateKey, Error> {
         let sk = self.child(i)?;
         let pk = sender_code.child(0)?;
         let sp = secret_point(&sk, pk)?;
@@ -177,6 +173,18 @@ impl PrivateCode {
         let mut sk_prime = sk.key;
         sk_prime.add_assign(&ss)?;
         let sk_prime = PrivateKey::new(sk_prime, self.network);
+
+        Ok(sk_prime)
+    }
+
+    /// Derives a receive address at the given index. If the index is invalid, it should be incremented.
+    pub fn address(
+        &self,
+        sender_code: &PublicCode,
+        i: u32,
+        segwit: bool,
+    ) -> Result<Address, Error> {
+        let sk_prime = self.private_key(sender_code, i)?;
         let pk_prime = PublicKey::from_private_key(&self.curve, &sk_prime);
 
         if segwit {
@@ -390,13 +398,22 @@ pub enum NotificationMode<'a> {
 pub struct BasicTransaction<'a>(&'a PublicCode);
 
 impl<'a> BasicTransaction<'a> {
-    /// Derives the notification address belonging to this payment code.
-    pub fn notification_address(&self, segwit: bool) -> Result<Address, Error> {
+    /// Derives the notification pubkey belonging to this payment code. This is exposed in case the
+    /// consumer needs the notification pubkey for any reason, such as for manual blinding operations.
+    /// Under normal circumstances, it is sufficient to use `notification_address`.
+    pub fn notification_pubkey(&self) -> Result<PublicKey, Error> {
         let child = self
             .0
             .xpub
             .ckd_pub(&self.0.curve, ChildNumber::from_normal_idx(0)?);
         let key = child?.public_key;
+
+        Ok(key)
+    }
+
+    /// Derives the notification address belonging to this payment code.
+    pub fn notification_address(&self, segwit: bool) -> Result<Address, Error> {
+        let key = self.notification_pubkey()?;
 
         if segwit {
             Address::p2wpkh(&key, self.0.network).map_err(Error::Address)
@@ -414,6 +431,12 @@ impl<'a> BasicTransaction<'a> {
         notification_utxo: &bitcoin::OutPoint,
     ) -> Result<(Script, Script), Error> {
         make_v1_notification_scripts(sender_code, self.0, notification_sk, notification_utxo)
+    }
+
+    /// Derives the notification private key belonging to a private payment code.
+    /// Needed if spending from a notification address etc.
+    pub fn notification_privkey(private_code: &PrivateCode) -> Result<PrivateKey, Error> {
+        private_code.child(0).map_err(Error::Bip32)
     }
 }
 
@@ -541,7 +564,7 @@ fn shared_secret(secret_point: [u8; 32]) -> Result<[u8; 32], secp256k1::Error> {
 /// Calculates a blinding factor. The operation is symmetrical, therefore the key combination can be:
 /// 1. notification private key, designated public key
 /// 2. designated private key, notification public key
-fn blinding_factor(
+pub fn blinding_factor(
     sk: &PrivateKey,
     pk: &PublicKey,
     utxo: &bitcoin::OutPoint,
