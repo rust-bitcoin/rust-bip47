@@ -130,7 +130,7 @@ impl PrivateCode {
 
     /// Generates a version 1 public payment code matching this private payment code, optionally with bitmessage.
     pub fn v1_public_code(&self, bitmessage: Option<BitMessagePreference>) -> PublicCode {
-        let xpub = ExtendedPubKey::from_private(&self.curve, &self.identity_key);
+        let xpub = ExtendedPubKey::from_priv(&self.curve, &self.identity_key);
 
         PublicCode {
             version: Version::V1,
@@ -143,7 +143,7 @@ impl PrivateCode {
 
     /// Generates a version 2 public payment code matching this private payment code.
     pub fn v2_public_code(&self) -> PublicCode {
-        let xpub = ExtendedPubKey::from_private(&self.curve, &self.identity_key);
+        let xpub = ExtendedPubKey::from_priv(&self.curve, &self.identity_key);
 
         PublicCode {
             version: Version::V1,
@@ -159,7 +159,7 @@ impl PrivateCode {
         let child_number = ChildNumber::from_normal_idx(i)?;
         let key = self.identity_key.ckd_priv(&self.curve, child_number)?;
 
-        Ok(key.private_key)
+        Ok(key.to_priv())
     }
 
     /// Derives a receive private key at the given index, with respect to a public payment code. Used for spending purposes.
@@ -170,7 +170,7 @@ impl PrivateCode {
         let sp = secret_point(&sk, pk)?;
         let ss = shared_secret(sp)?;
 
-        let mut sk_prime = sk.key;
+        let mut sk_prime = sk.inner;
         sk_prime.add_assign(&ss)?;
         let sk_prime = PrivateKey::new(sk_prime, self.network);
 
@@ -234,9 +234,9 @@ impl PublicCode {
     /// Derives the child public key at the given index. If the result is invalid, the index should be incremented.
     fn child(&self, i: u32) -> Result<PublicKey, bip32::Error> {
         let child_number = ChildNumber::from_normal_idx(i)?;
-        let key = self.xpub.ckd_pub(&self.curve, child_number)?;
+        let key = self.xpub.ckd_pub(&self.curve, child_number)?.to_pub();
 
-        Ok(key.public_key)
+        Ok(key)
     }
 
     /// Derives a send address at the given index. If the index is invalid, it should be incremented.
@@ -248,7 +248,7 @@ impl PublicCode {
 
         let ss = secp256k1::SecretKey::from_slice(&ss)?;
         let sg = secp256k1::PublicKey::from_secret_key(&self.curve, &ss);
-        let pk_prime = PublicKey::new(sg.combine(&pk.key)?);
+        let pk_prime = PublicKey::new(sg.combine(&pk.inner)?);
 
         if segwit {
             Address::p2wpkh(&pk_prime, self.network).map_err(Error::Address)
@@ -343,7 +343,7 @@ impl PublicCode {
 
         let version = Version::from_byte(payment_code[0])?;
         let bitmessage = payment_code[1] == 0x80;
-        let public_key = PublicKey::from_slice(&payment_code[2..35])?;
+        let public_key = PublicKey::from_slice(&payment_code[2..35])?.inner;
         let chain_code = ChainCode::from(&payment_code[35..67]);
         let bitmessage = if bitmessage {
             Some(BitMessagePreference {
@@ -379,7 +379,7 @@ impl PublicCode {
         let payment_code = base58::from_check(value).map_err(Error::Base58)?;
 
         if payment_code.first() != Some(&LETTER_P) {
-            return Err(Error::Format("Incorrect format version"));
+            return Err(Error::Format("Incorrect version bytes"));
         }
 
         PublicCode::try_from_bytes(&payment_code[1..])
@@ -406,7 +406,7 @@ impl<'a> BasicTransaction<'a> {
             .0
             .xpub
             .ckd_pub(&self.0.curve, ChildNumber::from_normal_idx(0)?);
-        let key = child?.public_key;
+        let key = child?.to_pub();
 
         Ok(key)
     }
@@ -455,14 +455,14 @@ impl<'a> Bitmessage<'a> {
             .xpub
             .ckd_pub(&self.code.curve, ChildNumber::from_normal_idx(0)?)?
             .ckd_pub(&self.code.curve, ChildNumber::from_normal_idx(0)?)?
-            .public_key;
+            .to_pub();
 
         let encryption_key = self
             .code
             .xpub
             .ckd_pub(&self.code.curve, ChildNumber::from_normal_idx(0)?)?
             .ckd_pub(&self.code.curve, ChildNumber::from_normal_idx(n)?)?
-            .public_key;
+            .to_pub();
 
         Ok(BitMessageSendParams {
             encryption_key,
@@ -548,9 +548,9 @@ pub struct BitMessageSendParams {
 
 /// Calculates a secret point given a private key and a public key.
 fn secret_point(sk: &PrivateKey, mut pk: PublicKey) -> Result<[u8; 32], secp256k1::Error> {
-    let _ = pk.key.mul_assign(&Secp256k1::new(), &sk.to_bytes())?;
+    pk.inner.mul_assign(&Secp256k1::new(), &sk.to_bytes())?;
     let mut point = [0_u8; 32];
-    point.copy_from_slice(&pk.key.serialize()[1..]);
+    point.copy_from_slice(&pk.inner.serialize()[1..]);
     Ok(point)
 }
 
@@ -569,7 +569,7 @@ pub fn blinding_factor(
     pk: &PublicKey,
     utxo: &bitcoin::OutPoint,
 ) -> Result<[u8; 64], secp256k1::Error> {
-    let mut pk = pk.key;
+    let mut pk = pk.inner;
     pk.mul_assign(&Secp256k1::new(), &sk.to_bytes())?;
 
     let mut encoded_utxo = Vec::with_capacity(36);
@@ -658,7 +658,7 @@ fn find_designated(tx: &Transaction) -> Option<(PublicKey, OutPoint)> {
 }
 
 /// Represents an error as pertaining to BIP47 operations.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Error {
     Format(&'static str),
     Base58(base58::Error),
@@ -667,6 +667,7 @@ pub enum Error {
     UnsupportedVersion,
     Notification(&'static str),
     Address(address::Error),
+    Key(bitcoin::util::key::Error),
 }
 
 impl From<bip32::Error> for Error {
@@ -683,16 +684,7 @@ impl From<secp256k1::Error> for Error {
 
 impl From<bitcoin::util::key::Error> for Error {
     fn from(error: bitcoin::util::key::Error) -> Self {
-        match error {
-            bitcoin::util::key::Error::Base58(error) => Error::Base58(error),
-            bitcoin::util::key::Error::Secp256k1(error) => Error::Ecdsa(error),
-        }
-    }
-}
-
-impl From<address::Error> for Error {
-    fn from(error: address::Error) -> Self {
-        Error::Address(error)
+        Error::Key(error)
     }
 }
 
@@ -837,8 +829,8 @@ mod tests {
 
         let alice_a0 = alice_private.child(0).unwrap();
         let alice_A0 = PublicKey::from_private_key(&Secp256k1::new(), &alice_a0);
-        assert_eq!(ALICE_a0, alice_a0.key.to_string());
-        assert_eq!(ALICE_A0, alice_A0.key.to_string());
+        assert_eq!(ALICE_a0, alice_a0.inner.display_secret().to_string());
+        assert_eq!(ALICE_A0, alice_A0.to_string());
 
         // Bob
         let bob_seed: Vec<u8> = hashes::hex::FromHex::from_hex(BOB_BIP32_SEED).unwrap();
@@ -850,12 +842,12 @@ mod tests {
         let bob_B0 = PublicKey::from_private_key(&Secp256k1::new(), &bob_b0);
         let bob_B1 = PublicKey::from_private_key(&Secp256k1::new(), &bob_b1);
         let bob_B2 = PublicKey::from_private_key(&Secp256k1::new(), &bob_b2);
-        assert_eq!(BOB_b0, bob_b0.key.to_string());
-        assert_eq!(BOB_b1, bob_b1.key.to_string());
-        assert_eq!(BOB_b2, bob_b2.key.to_string());
-        assert_eq!(BOB_B0, bob_B0.key.to_string());
-        assert_eq!(BOB_B1, bob_B1.key.to_string());
-        assert_eq!(BOB_B2, bob_B2.key.to_string());
+        assert_eq!(BOB_b0, bob_b0.inner.display_secret().to_string());
+        assert_eq!(BOB_b1, bob_b1.inner.display_secret().to_string());
+        assert_eq!(BOB_b2, bob_b2.inner.display_secret().to_string());
+        assert_eq!(BOB_B0, bob_B0.to_string());
+        assert_eq!(BOB_B1, bob_B1.to_string());
+        assert_eq!(BOB_B2, bob_B2.to_string());
     }
 
     #[test]
@@ -864,7 +856,7 @@ mod tests {
         let alice_public = PublicCode::from_wif(ALICE_PAYMENT_CODE).unwrap();
 
         let alice_A0 = alice_public.child(0).unwrap();
-        assert_eq!(ALICE_A0, alice_A0.key.to_string());
+        assert_eq!(ALICE_A0, alice_A0.to_string());
     }
 
     #[test]
